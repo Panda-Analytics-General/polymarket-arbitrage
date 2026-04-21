@@ -362,6 +362,11 @@ async def run_cross_platform_only(config: BotConfig, args: argparse.Namespace) -
         config=config,
         min_similarity=args.min_similarity,
         strict_matching=not args.allow_loose_matching,
+        use_llm_verifier=args.llm_verify,
+        llm_model=args.llm_model,
+        llm_base_url=args.llm_url,
+        llm_min_confidence=args.llm_min_confidence,
+        llm_concurrency=args.llm_concurrency,
     )
 
     loop = asyncio.get_event_loop()
@@ -512,6 +517,48 @@ Examples:
         action="store_true",
         dest="allow_loose_matching",
         help="Disable strict matching mode for --cross-platform. Not recommended.",
+    )
+
+    parser.add_argument(
+        "--llm-verify",
+        action="store_true",
+        dest="llm_verify",
+        help="After lexical matching, verify each pair's resolution criteria "
+             "using a local Ollama LLM. Requires 'ollama serve' to be running.",
+    )
+
+    parser.add_argument(
+        "--llm-model",
+        type=str,
+        default="llama3.1:8b",
+        dest="llm_model",
+        help="Ollama model for --llm-verify (default: llama3.1:8b). "
+             "Must be pulled locally: ollama pull <model>.",
+    )
+
+    parser.add_argument(
+        "--llm-url",
+        type=str,
+        default="http://localhost:11434",
+        dest="llm_url",
+        help="Ollama base URL (default: http://localhost:11434).",
+    )
+
+    parser.add_argument(
+        "--llm-min-confidence",
+        type=float,
+        default=0.6,
+        dest="llm_min_confidence",
+        help="Minimum LLM confidence to accept 'equivalent' verdict (0-1, default: 0.6).",
+    )
+
+    parser.add_argument(
+        "--llm-concurrency",
+        type=int,
+        default=4,
+        dest="llm_concurrency",
+        help="Parallel LLM requests for verification (default: 4). Higher = faster "
+             "but uses more RAM. Typical range 2-8.",
     )
     
     parser.add_argument(

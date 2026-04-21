@@ -38,6 +38,10 @@ class KalshiMarket:
     
     # Category
     category: str = ""
+
+    # Resolution criteria (from /markets/{ticker} or /events with_nested_markets)
+    rules_primary: str = ""
+    rules_secondary: str = ""
     
     @property
     def is_active(self) -> bool:

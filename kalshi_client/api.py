@@ -267,6 +267,8 @@ class KalshiClient:
                             or m.get("open_interest", 0),
                         close_time=close_time,
                         category=category,
+                        rules_primary=m.get("rules_primary", "") or "",
+                        rules_secondary=m.get("rules_secondary", "") or "",
                     )
                     if market.ticker:
                         self._markets_cache[market.ticker] = market

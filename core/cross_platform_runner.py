@@ -22,6 +22,7 @@ from polymarket_client import PolymarketClient
 from polymarket_client.models import TokenType
 from kalshi_client import KalshiClient
 from core.cross_platform_arb import CrossPlatformArbEngine, MarketPair
+from core.llm_verifier import OllamaVerifier
 from utils.config_loader import BotConfig
 
 
@@ -46,6 +47,11 @@ class CrossPlatformRunner:
         strict_matching: bool = True,
         poll_interval: float = 5.0,
         pair_batch_size: int = 25,
+        use_llm_verifier: bool = False,
+        llm_model: str = "llama3.1:8b",
+        llm_base_url: str = "http://localhost:11434",
+        llm_min_confidence: float = 0.6,
+        llm_concurrency: int = 4,
     ):
         """
         Args:
@@ -54,10 +60,21 @@ class CrossPlatformRunner:
             strict_matching: Enable strict mode in MarketMatcher.
             poll_interval: Delay (seconds) between batches when polling pairs.
             pair_batch_size: Number of pairs to poll concurrently per batch.
+            use_llm_verifier: If True, run each lexically matched pair through
+                a local Ollama LLM to verify resolution criteria match.
+            llm_model: Ollama model name (must be pulled locally).
+            llm_base_url: Ollama server URL.
+            llm_min_confidence: Minimum LLM confidence to accept
+                'equivalent' verdict.
         """
         self.config = config
         self.poll_interval = poll_interval
         self.pair_batch_size = pair_batch_size
+        self.use_llm_verifier = use_llm_verifier
+        self.llm_model = llm_model
+        self.llm_base_url = llm_base_url
+        self.llm_min_confidence = llm_min_confidence
+        self.llm_concurrency = llm_concurrency
         self._running = False
         self._start_time: Optional[datetime] = None
         self.stats = CrossPlatformRunnerStats()
@@ -74,9 +91,13 @@ class CrossPlatformRunner:
             min_similarity=min_similarity,
         )
 
-        # Cache token ids for matched Polymarket markets
+        # Cache token ids and full market objects for matched Polymarket markets
         self._poly_token_ids: dict[str, tuple[str, str]] = {}
+        self._poly_markets_by_id: dict[str, object] = {}
+        self._kalshi_markets_by_ticker: dict[str, object] = {}
         self._matched_pairs: list[MarketPair] = []
+        # pair_id -> (best_net_edge_seen, description_str)
+        self._near_miss: dict[str, tuple[float, str]] = {}
 
     async def start(self) -> None:
         logger.info("=" * 60)
@@ -160,6 +181,9 @@ class CrossPlatformRunner:
         for m in poly_markets:
             if m.yes_token_id and m.no_token_id:
                 self._poly_token_ids[m.market_id] = (m.yes_token_id, m.no_token_id)
+            self._poly_markets_by_id[m.market_id] = m
+        for km in kalshi_markets:
+            self._kalshi_markets_by_ticker[km.ticker] = km
 
         # Run matcher
         logger.info("Matching markets (strict=%s, min_sim=%.2f)...",
@@ -167,17 +191,22 @@ class CrossPlatformRunner:
         self._matched_pairs = await self.engine.matcher.find_matches(
             poly_markets, kalshi_markets
         )
-        self.stats.pairs_matched = len(self._matched_pairs)
-
         # Keep only pairs for which we have Polymarket token IDs (others can't be priced)
         self._matched_pairs = [
             p for p in self._matched_pairs
             if p.polymarket_id in self._poly_token_ids
         ]
         logger.info(
-            f"=== MATCHED PAIRS READY: {len(self._matched_pairs)} "
+            f"=== LEXICALLY MATCHED PAIRS: {len(self._matched_pairs)} "
             f"(with orderbook-capable Polymarket tokens) ==="
         )
+
+        # Optional LLM verification of resolution criteria
+        if self.use_llm_verifier and self._matched_pairs:
+            self._matched_pairs = await self._verify_pairs_with_llm(self._matched_pairs)
+
+        logger.info(f"=== MATCHED PAIRS READY: {len(self._matched_pairs)} ===")
+        self.stats.pairs_matched = len(self._matched_pairs)
         for p in self._matched_pairs[:20]:
             logger.info(
                 f"  [{p.category}] sim={p.similarity_score:.2f} | "
@@ -185,6 +214,63 @@ class CrossPlatformRunner:
             )
         if len(self._matched_pairs) > 20:
             logger.info(f"  ... and {len(self._matched_pairs) - 20} more")
+
+    async def _verify_pairs_with_llm(
+        self, pairs: list[MarketPair]
+    ) -> list[MarketPair]:
+        """Run each lexically matched pair through Ollama; keep only equivalents."""
+        logger.info(
+            f"Running LLM verification on {len(pairs)} pairs "
+            f"(model={self.llm_model}, min_conf={self.llm_min_confidence})..."
+        )
+        kept: list[MarketPair] = []
+        async with OllamaVerifier(
+            base_url=self.llm_base_url,
+            model=self.llm_model,
+            max_concurrency=self.llm_concurrency,
+        ) as verifier:
+            if not await verifier.health_check():
+                logger.error(
+                    "Ollama server unreachable or model not pulled. "
+                    "Skipping LLM verification and KEEPING all lexical matches."
+                )
+                return pairs
+
+            async def _verify_one(idx: int, pair: MarketPair):
+                poly_m = self._poly_markets_by_id.get(pair.polymarket_id)
+                kalshi_m = self._kalshi_markets_by_ticker.get(pair.kalshi_ticker)
+                poly_rules = getattr(poly_m, "description", "") if poly_m else ""
+                kalshi_rules = "\n\n".join(
+                    s for s in (
+                        getattr(kalshi_m, "rules_primary", "") if kalshi_m else "",
+                        getattr(kalshi_m, "rules_secondary", "") if kalshi_m else "",
+                    ) if s
+                )
+                decision = await verifier.verify_pair(
+                    pair.polymarket_question,
+                    poly_rules,
+                    pair.kalshi_title,
+                    kalshi_rules,
+                )
+                keep = (
+                    decision.is_equivalent
+                    and decision.confidence >= self.llm_min_confidence
+                )
+                logger.info(
+                    f"  [{idx}/{len(pairs)}] {'KEEP' if keep else 'DROP'} "
+                    f"verdict={decision.verdict} conf={decision.confidence:.2f} | "
+                    f"{pair.polymarket_question[:50]} <> {pair.kalshi_title[:50]} "
+                    f"| {decision.reasoning[:120]}"
+                )
+                return pair if keep else None
+
+            results = await asyncio.gather(*[
+                _verify_one(i, p) for i, p in enumerate(pairs, 1)
+            ], return_exceptions=False)
+            kept = [p for p in results if p is not None]
+
+        logger.info(f"LLM verification: {len(kept)}/{len(pairs)} pairs accepted.")
+        return kept
 
     async def _poll_loop(self) -> None:
         """Continuously poll order books for all matched pairs."""
@@ -241,8 +327,71 @@ class CrossPlatformRunner:
             opp = self.engine.check_arbitrage(pair, poly_ob, kalshi_ob)
             if opp:
                 self.stats.opportunities_found += 1
+                logger.info(
+                    "ARB! %s | net=%.4f (%.2f%%) | buy %s @%.3f sell @%.3f | "
+                    "liq buy=%.0f sell=%.0f | P:%s <> K:%s",
+                    opp.token,
+                    opp.net_edge,
+                    opp.edge_pct * 100,
+                    opp.buy_platform,
+                    opp.buy_price,
+                    opp.sell_price,
+                    opp.buy_liquidity,
+                    opp.sell_liquidity,
+                    pair.polymarket_question[:50],
+                    pair.kalshi_title[:50],
+                )
+            else:
+                # Track top near-misses for diagnostics
+                self._record_near_miss(pair, poly_ob, kalshi_ob)
         except Exception as e:
             logger.debug(f"Pair check failed for {pair.pair_id}: {e}")
+
+    def _record_near_miss(self, pair, poly_ob, kalshi_ob) -> None:
+        """Compute best possible net edge (even if negative) and track it."""
+        try:
+            py_ask = poly_ob.best_ask_yes or 0
+            py_bid = poly_ob.best_bid_yes or 0
+            pn_ask = poly_ob.best_ask_no or 0
+            pn_bid = poly_ob.best_bid_no or 0
+            ky_ask = kalshi_ob.best_ask_yes or 0
+            ky_bid = kalshi_ob.best_bid_yes or 0
+            kn_ask = kalshi_ob.best_ask_no or 0
+            kn_bid = kalshi_ob.best_bid_no or 0
+
+            pt_fee = self.engine.polymarket_taker_fee
+            kt_fee = self.engine.kalshi_taker_fee
+            gas = self.engine.gas_cost
+
+            candidates = []
+            if py_ask and ky_bid:
+                candidates.append(("YES poly->kalshi", ky_bid - py_ask
+                                   - py_ask*pt_fee - ky_bid*kt_fee - 2*gas,
+                                   py_ask, ky_bid))
+            if ky_ask and py_bid:
+                candidates.append(("YES kalshi->poly", py_bid - ky_ask
+                                   - ky_ask*kt_fee - py_bid*pt_fee - 2*gas,
+                                   ky_ask, py_bid))
+            if pn_ask and kn_bid:
+                candidates.append(("NO poly->kalshi", kn_bid - pn_ask
+                                   - pn_ask*pt_fee - kn_bid*kt_fee - 2*gas,
+                                   pn_ask, kn_bid))
+            if kn_ask and pn_bid:
+                candidates.append(("NO kalshi->poly", pn_bid - kn_ask
+                                   - kn_ask*kt_fee - pn_bid*pt_fee - 2*gas,
+                                   kn_ask, pn_bid))
+            if not candidates:
+                return
+            label, net, bp, sp = max(candidates, key=lambda x: x[1])
+            desc = (
+                f"{label} buy@{bp:.3f} sell@{sp:.3f} | "
+                f"{pair.polymarket_question[:40]} <> {pair.kalshi_title[:40]}"
+            )
+            prev = self._near_miss.get(pair.pair_id)
+            if prev is None or net > prev[0]:
+                self._near_miss[pair.pair_id] = (net, desc)
+        except Exception:
+            pass
 
     async def _snapshot_loop(self) -> None:
         """Periodic log of runtime stats."""
@@ -257,6 +406,14 @@ class CrossPlatformRunner:
                     self.stats.pairs_polled,
                     self.stats.opportunities_found,
                 )
+                # Log top near-misses (pairs closest to arbitrage)
+                top = sorted(
+                    self._near_miss.values(), key=lambda x: x[0], reverse=True
+                )[:5]
+                if top:
+                    logger.info("Top 5 near-miss spreads (net edge, negative = loss):")
+                    for edge, desc in top:
+                        logger.info(f"  net={edge:+.4f} | {desc}")
             except asyncio.CancelledError:
                 return
             except Exception as e:
