@@ -48,6 +48,9 @@ class TradingConfig:
     max_order_size: float = 200.0
     slippage_tolerance: float = 0.02
     order_timeout_seconds: float = 60.0
+    maker_fee_bps: float = 0.0
+    taker_fee_bps: float = 100.0
+    estimated_gas_per_order: float = 0.02
 
 
 @dataclass

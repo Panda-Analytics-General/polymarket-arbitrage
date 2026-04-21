@@ -48,9 +48,11 @@ class ArbConfig:
     signal_expiry_seconds: float = 5.0
     
     # Fees (in basis points - 100 bps = 1%)
-    # Polymarket: ~0% maker, ~1.5% taker
+    # Polymarket taker fees are price-dependent (feeRate * p * (1-p)).
+    # 100 bps (~1%) approximates the average near p=0.5 for most categories.
+    # Sell orders pay no taker fee (see _check_bundle_arbitrage).
     maker_fee_bps: float = 0        # Limit orders adding liquidity
-    taker_fee_bps: float = 150      # Taking liquidity (1.5%)
+    taker_fee_bps: float = 100      # Taking liquidity
     gas_cost_per_order: float = 0.02  # ~$0.02 on Polygon
 
 
@@ -300,12 +302,13 @@ class ArbEngine:
         taker_fee_pct = self.config.taker_fee_bps / 10000  # Convert bps to decimal
         gas_cost = self.config.gas_cost_per_order * 2  # 2 orders
         
-        # For bundle long: we buy both, pay fees on each
+        # For bundle long: we buy both, pay taker fees on each
         # Fee cost = taker_fee_pct * (ask_yes + ask_no) = taker_fee_pct * total_ask
         fee_cost_long = taker_fee_pct * total_ask
         
-        # For bundle short: we sell both, pay fees on each  
-        fee_cost_short = taker_fee_pct * total_bid
+        # For bundle short: we sell both. Polymarket does NOT charge taker fees
+        # on sell orders, so there is no per-notional fee to subtract.
+        fee_cost_short = 0.0
         
         opportunity: Optional[Opportunity] = None
         

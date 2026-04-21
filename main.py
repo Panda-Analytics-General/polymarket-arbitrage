@@ -129,6 +129,9 @@ class TradingBot:
             default_order_size=self.config.trading.default_order_size,
             min_order_size=self.config.trading.min_order_size,
             max_order_size=self.config.trading.max_order_size,
+            maker_fee_bps=self.config.trading.maker_fee_bps,
+            taker_fee_bps=self.config.trading.taker_fee_bps,
+            gas_cost_per_order=self.config.trading.estimated_gas_per_order,
         ))
         
         # Initialize data feed
@@ -306,6 +309,9 @@ async def run_backtest(config: BotConfig, duration: float = 300.0) -> None:
         mm_enabled=config.trading.mm_enabled,
         tick_size=config.trading.tick_size,
         default_order_size=config.trading.default_order_size,
+        maker_fee_bps=config.trading.maker_fee_bps,
+        taker_fee_bps=config.trading.taker_fee_bps,
+        gas_cost_per_order=config.trading.estimated_gas_per_order,
     ))
     
     # Use placeholder client for execution

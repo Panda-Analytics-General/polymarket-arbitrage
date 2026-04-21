@@ -500,21 +500,34 @@ class PolymarketClient(BasePolymarketClient):
                 base_url=self.rest_url,
             )
             
-            # Parse bids and asks
-            bids = []
-            asks = []
-            
-            for bid in data.get("bids", [])[:10]:
-                bids.append(PriceLevel(
-                    price=float(bid.get("price", 0)),
-                    size=float(bid.get("size", 0)),
-                ))
-            
-            for ask in data.get("asks", [])[:10]:
-                asks.append(PriceLevel(
-                    price=float(ask.get("price", 0)),
-                    size=float(ask.get("size", 0)),
-                ))
+            # Parse bids and asks.
+            # Polymarket /book returns bids sorted ascending (worst->best)
+            # and asks sorted descending (worst->best), so we reverse both
+            # to get best-first ordering expected by the rest of the code.
+            raw_bids = list(data.get("bids", []))
+            raw_asks = list(data.get("asks", []))
+
+            bids_sorted = sorted(
+                raw_bids, key=lambda x: float(x.get("price", 0)), reverse=True
+            )
+            asks_sorted = sorted(
+                raw_asks, key=lambda x: float(x.get("price", 0))
+            )
+
+            bids = [
+                PriceLevel(
+                    price=float(b.get("price", 0)),
+                    size=float(b.get("size", 0)),
+                )
+                for b in bids_sorted[:10]
+            ]
+            asks = [
+                PriceLevel(
+                    price=float(a.get("price", 0)),
+                    size=float(a.get("size", 0)),
+                )
+                for a in asks_sorted[:10]
+            ]
             
             return TokenOrderBook(
                 token_type=token_type,

@@ -45,9 +45,12 @@ trading:
   slippage_tolerance: 0.02  # Max allowed slippage from signal to execution
   order_timeout_seconds: 60 # Cancel unfilled orders after this time
   
-  # Fees (Polymarket rates - conservative estimates)
-  maker_fee_bps: 0          # 0% for maker (limit orders adding liquidity)
-  taker_fee_bps: 150        # 1.5% for taker (taking liquidity)
+  # Fees (Polymarket taker fees, ~March 2026)
+  # Fee is price-dependent (feeRate * p * (1-p), max ~1.8% at p=0.5).
+  # 100 bps (feeRate ~0.04) is a reasonable average across Politics/Finance/Tech.
+  # Sell orders pay no taker fee; maker fees are 0.
+  maker_fee_bps: 0
+  taker_fee_bps: 100
   estimated_gas_per_order: 0.02  # ~$0.02 gas on Polygon
 
 risk:
