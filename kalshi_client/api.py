@@ -161,6 +161,130 @@ class KalshiClient:
             title=e.get("title", ""),
             category=e.get("category", ""),
         )
+
+    async def list_events_with_markets(
+        self,
+        status: str = "open",
+        max_events: int = 5000,
+    ) -> list[KalshiMarket]:
+        """
+        Fetch events via /events?with_nested_markets=true and flatten their
+        markets into KalshiMarket objects. This endpoint EXCLUDES multivariate
+        (parlay / multi-game) events, which is exactly what we want for
+        cross-platform matching.
+
+        The returned KalshiMarket.title is composed from the parent event title
+        plus the market's yes_sub_title/subtitle so it reads as a natural
+        question (e.g. "Kansas City Chiefs vs San Francisco 49ers: Chiefs win").
+        """
+        flattened: list[KalshiMarket] = []
+        cursor: Optional[str] = None
+
+        while len(flattened) < max_events:
+            params = {
+                "limit": 200,
+                "status": status,
+                "with_nested_markets": "true",
+            }
+            if cursor:
+                params["cursor"] = cursor
+
+            data = await self._get("/events", params=params)
+            if not data or "events" not in data:
+                break
+
+            events = data.get("events") or []
+            if not events:
+                break
+
+            for ev in events:
+                ev_title = ev.get("title", "") or ev.get("sub_title", "")
+                ev_ticker = ev.get("event_ticker", "")
+                series_ticker = ev.get("series_ticker", "")
+                category = ev.get("category", "")
+
+                for m in ev.get("markets", []) or []:
+                    if m.get("status") not in ("active", "open", "initialized", None, ""):
+                        # Skip settled/closed/determined markets
+                        if m.get("status") in ("settled", "closed", "determined", "finalized"):
+                            continue
+
+                    sub = (m.get("yes_sub_title") or m.get("subtitle") or "").strip()
+                    m_title = (m.get("title") or "").strip()
+
+                    # Prefer the market's own question-style title when it is
+                    # clearly specific (longer than the event title). Otherwise
+                    # combine event title with subtitle for disambiguation so
+                    # multi-outcome events (e.g. presidential elections) don't
+                    # all collapse to the same string.
+                    if m_title and len(m_title) > len(ev_title):
+                        composite = m_title
+                    elif sub and ev_title:
+                        composite = f"{ev_title}: {sub}"
+                    elif m_title:
+                        composite = m_title
+                    else:
+                        composite = ev_title or sub
+
+                    # Dollar-denominated fields (new API) or cent fields (legacy)
+                    def _to_float(v):
+                        try:
+                            return float(v)
+                        except (TypeError, ValueError):
+                            return 0.0
+
+                    yes_price = _to_float(m.get("yes_ask_dollars")) \
+                        or _to_float(m.get("last_price_dollars"))
+                    no_price = _to_float(m.get("no_ask_dollars"))
+                    if yes_price == 0 and m.get("yes_price"):
+                        yes_price = m["yes_price"] / 100.0
+                    if no_price == 0 and m.get("no_price"):
+                        no_price = m["no_price"] / 100.0
+                    if no_price == 0 and yes_price > 0:
+                        no_price = 1.0 - yes_price
+
+                    close_time = None
+                    if m.get("close_time"):
+                        try:
+                            close_time = datetime.fromisoformat(
+                                m["close_time"].replace("Z", "+00:00")
+                            )
+                        except Exception:
+                            pass
+
+                    market = KalshiMarket(
+                        ticker=m.get("ticker", ""),
+                        event_ticker=ev_ticker,
+                        series_ticker=series_ticker,
+                        title=composite,
+                        subtitle=sub,
+                        yes_price=yes_price,
+                        no_price=no_price,
+                        status=m.get("status", ""),
+                        result=m.get("result"),
+                        volume=_to_float(m.get("volume_fp")) or m.get("volume", 0),
+                        open_interest=_to_float(m.get("open_interest_fp"))
+                            or m.get("open_interest", 0),
+                        close_time=close_time,
+                        category=category,
+                    )
+                    if market.ticker:
+                        self._markets_cache[market.ticker] = market
+                        flattened.append(market)
+
+            logger.info(
+                f"Kalshi: {len(flattened)} markets loaded from {len(events)} events..."
+            )
+
+            cursor = data.get("cursor")
+            if not cursor:
+                break
+            await asyncio.sleep(0.1)
+
+        logger.info(
+            f"Kalshi events pipeline: {len(flattened)} total single-outcome markets"
+        )
+        return flattened[:max_events]
     
     # =========================================================================
     # MARKETS ENDPOINTS

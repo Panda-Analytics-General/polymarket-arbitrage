@@ -26,6 +26,7 @@ from core.arb_engine import ArbEngine, ArbConfig
 from core.execution import ExecutionEngine, ExecutionConfig
 from core.risk_manager import RiskManager, RiskConfig
 from core.portfolio import Portfolio
+from core.cross_platform_runner import CrossPlatformRunner
 from utils.config_loader import load_config, BotConfig
 from utils.logging_utils import setup_logging, performance_logger
 
@@ -352,6 +353,41 @@ async def run_backtest(config: BotConfig, duration: float = 300.0) -> None:
     return result
 
 
+async def run_cross_platform_only(config: BotConfig, args: argparse.Namespace) -> None:
+    """Run cross-platform-only arbitrage detection (Polymarket <-> Kalshi)."""
+    # Force dry-run: we don't have a live executor for cross-platform yet.
+    config.mode.trading_mode = "dry_run"
+
+    runner = CrossPlatformRunner(
+        config=config,
+        min_similarity=args.min_similarity,
+        strict_matching=not args.allow_loose_matching,
+    )
+
+    loop = asyncio.get_event_loop()
+    shutdown_event = asyncio.Event()
+
+    def signal_handler():
+        logger.info("Received shutdown signal")
+        shutdown_event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, signal_handler)
+        except NotImplementedError:
+            pass
+
+    try:
+        await runner.start()
+        await shutdown_event.wait()
+    except KeyboardInterrupt:
+        logger.info("Keyboard interrupt received")
+    except Exception as e:
+        logger.exception(f"Cross-platform runner error: {e}")
+    finally:
+        await runner.stop()
+
+
 async def main_async(args: argparse.Namespace) -> None:
     """Async main function."""
     # Load configuration
@@ -370,6 +406,11 @@ async def main_async(args: argparse.Namespace) -> None:
     # Run backtest if requested
     if args.backtest:
         await run_backtest(config, duration=args.backtest_duration)
+        return
+
+    # Run cross-platform-only mode if requested
+    if args.cross_platform:
+        await run_cross_platform_only(config, args)
         return
     
     # Create and run the bot
@@ -408,10 +449,12 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python main.py                    Run in dry-run mode
-  python main.py --live             Run in live trading mode
-  python main.py --backtest         Run backtest simulation
-  python main.py -c custom.yaml     Use custom config file
+  python main.py                          Run in dry-run mode
+  python main.py --live                   Run in live trading mode
+  python main.py --backtest               Run backtest simulation
+  python main.py --cross-platform         Cross-platform arb only (Polymarket <-> Kalshi, dry-run)
+  python main.py --cross-platform --min-similarity 0.9    Stricter matching
+  python main.py -c custom.yaml           Use custom config file
         """
     )
     
@@ -445,6 +488,30 @@ Examples:
         type=float,
         default=300.0,
         help="Backtest duration in simulated seconds (default: 300)"
+    )
+
+    parser.add_argument(
+        "--cross-platform",
+        action="store_true",
+        dest="cross_platform",
+        help="Run cross-platform-only arbitrage (Polymarket <-> Kalshi). "
+             "Forces dry-run. Uses strict market matching by default.",
+    )
+
+    parser.add_argument(
+        "--min-similarity",
+        type=float,
+        default=0.85,
+        dest="min_similarity",
+        help="Minimum market-match similarity for --cross-platform (0-1). "
+             "Default: 0.85 (very secure). Lower = more matches, more false positives.",
+    )
+
+    parser.add_argument(
+        "--allow-loose-matching",
+        action="store_true",
+        dest="allow_loose_matching",
+        help="Disable strict matching mode for --cross-platform. Not recommended.",
     )
     
     parser.add_argument(

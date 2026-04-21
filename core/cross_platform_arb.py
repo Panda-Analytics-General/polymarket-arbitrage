@@ -165,22 +165,52 @@ class MarketMatcher:
         "san antonio spurs": ["spurs", "san antonio"],
     }
     
-    def __init__(self, min_similarity: float = 0.5):  # Higher threshold for quality
+    def __init__(self, min_similarity: float = 0.5, strict: bool = False):
         """
         Initialize matcher.
         
         Args:
             min_similarity: Minimum similarity score (0-1) to consider a match
+            strict: If True, only accept high-confidence matches:
+                - Sports: exact 2-team set match AND matching date
+                - Person/event: same person AND same action keyword
+                - Generic text: combined similarity must reach min_similarity
+                  via entity overlap (not pure fuzzy text)
+                The generic fuzzy-only fallback is disabled in strict mode.
         """
         self.min_similarity = min_similarity
+        self.strict = strict
         self._matched_pairs: dict[str, MarketPair] = {}
-        
-        # Build reverse lookup for team names
+
+        # Ambiguous team variants that collide with common English words or other
+        # proper nouns. These produce floods of false matches and must NOT be
+        # used as team identifiers.
+        ambiguous_variants = {
+            "no", "ne", "nyg", "nyj", "was", "car", "den", "ind", "ten",
+            "gb", "kc", "sf", "lv", "lac", "lar", "tb", "mia", "chi", "det",
+            "pit", "phi", "hou", "jax", "cin", "cle", "bal", "buf", "ari",
+            "dal", "atl", "min", "sea", "okc",
+            # Overly generic single-word tokens
+            "washington", "chicago", "cleveland", "detroit", "houston",
+            "indiana", "minnesota", "new york", "los angeles", "san francisco",
+            "san antonio", "new orleans", "atlanta", "dallas", "phoenix",
+            "sacramento", "philadelphia", "brooklyn", "memphis", "orlando",
+            "charlotte", "denver", "miami", "milwaukee", "toronto", "boston",
+            "portland", "utah", "tampa bay", "green bay", "pittsburgh",
+            "kansas city", "las vegas", "la chargers", "la rams", "la clippers",
+            "la lakers", "ny giants", "ny jets",
+            "magic", "heat", "kings", "jazz", "nets", "wizards",
+        }
+
+        # Build reverse lookup for team names (exclude ambiguous variants)
         self._team_lookup = {}
         for full_name, variants in {**self.NFL_TEAMS, **self.NBA_TEAMS}.items():
             self._team_lookup[full_name] = full_name
             for variant in variants:
-                self._team_lookup[variant.lower()] = full_name
+                v = variant.lower()
+                if v in ambiguous_variants or len(v) <= 3:
+                    continue
+                self._team_lookup[v] = full_name
     
     def normalize_text(self, text: str) -> str:
         """Normalize text for comparison."""
@@ -191,19 +221,22 @@ class MarketMatcher:
         return ' '.join(words)
     
     def extract_teams(self, text: str) -> list[str]:
-        """Extract team names from text."""
+        """Extract team names from text (word-boundary match only)."""
         text_lower = text.lower()
         found_teams = []
-        
-        # Check for team names (longest match first)
+
+        # Check for team names (longest match first). Use word-boundary regex
+        # so tokens like "car" don't match inside "carolina", "scar", etc.
         for team_key in sorted(self._team_lookup.keys(), key=len, reverse=True):
-            if team_key in text_lower:
+            # \b works for alphanumeric boundaries; escape key for safety.
+            pattern = r'\b' + re.escape(team_key) + r'\b'
+            if re.search(pattern, text_lower):
                 canonical = self._team_lookup[team_key]
                 if canonical not in found_teams:
                     found_teams.append(canonical)
-                    # Remove from text to avoid double matches
-                    text_lower = text_lower.replace(team_key, "")
-        
+                    # Blank out matched substring to prevent overlap
+                    text_lower = re.sub(pattern, ' ', text_lower)
+
         return found_teams
     
     def extract_key_entities(self, text: str) -> set[str]:
@@ -364,12 +397,22 @@ class MarketMatcher:
         """
         # First check for sports matchup (highest priority)
         is_sports, sports_score = self.is_sports_match(polymarket_question, kalshi_title)
+        if is_sports and sports_score >= 0.95:
+            return sports_score
+        # In strict mode, only accept the exact-teams-and-date sports path (>=0.95)
+        if self.strict and is_sports and sports_score < 0.95:
+            return 0.0
         if is_sports and sports_score > 0.7:
             return sports_score
         
         # Check for same person/event predictions
         is_person, person_score = self.is_same_person_event(polymarket_question, kalshi_title)
-        if is_person and person_score > 0.7:
+        # In strict mode, only accept the same-person + same-action path (>=0.85)
+        if self.strict and is_person and person_score < 0.85:
+            return 0.0
+        if is_person and person_score >= 0.85:
+            return person_score
+        if not self.strict and is_person and person_score > 0.7:
             return person_score
         
         # Normalize texts
@@ -389,6 +432,15 @@ class MarketMatcher:
             combined_sim = 0.5 * text_sim + 0.5 * entity_overlap
         else:
             combined_sim = text_sim
+        
+        # In strict mode, require BOTH meaningful entity overlap AND high fuzzy
+        # text similarity - reject matches that rely on fuzzy text alone.
+        if self.strict:
+            if not poly_entities or not kalshi_entities:
+                return 0.0
+            entity_overlap = len(poly_entities & kalshi_entities) / max(len(poly_entities), len(kalshi_entities))
+            if entity_overlap < 0.5 or text_sim < 0.6:
+                return 0.0
         
         # Boost if both mention same sport type
         sport_keywords = ["nfl", "nba", "mlb", "nhl", "football", "basketball", "baseball", "hockey"]
@@ -435,9 +487,10 @@ class MarketMatcher:
         if any(x in text_lower for x in sports_keywords):
             return 'sports'
         
-        # Check for team names
-        if any(x in text_lower for x in self._team_lookup.keys()):
-            return 'sports'
+        # Check for team names (word-boundary match only)
+        for team_key in self._team_lookup.keys():
+            if re.search(r'\b' + re.escape(team_key) + r'\b', text_lower):
+                return 'sports'
         
         # Entertainment
         if any(x in text_lower for x in ['oscar', 'grammy', 'emmy', 'movie', 'film', 'album',
@@ -590,9 +643,11 @@ class CrossPlatformArbEngine:
     def __init__(
         self,
         min_edge: float = 0.02,  # 2% minimum edge
-        polymarket_taker_fee: float = 0.015,  # 1.5%
+        polymarket_taker_fee: float = 0.01,  # ~1% avg at p=0.5
         kalshi_taker_fee: float = 0.01,  # ~1% estimate
         gas_cost: float = 0.02,  # Gas cost per order
+        strict_matching: bool = False,
+        min_similarity: float = 0.5,
     ):
         """
         Initialize cross-platform arb engine.
@@ -602,13 +657,18 @@ class CrossPlatformArbEngine:
             polymarket_taker_fee: Polymarket taker fee rate
             kalshi_taker_fee: Kalshi taker fee rate
             gas_cost: Estimated gas cost per order
+            strict_matching: If True, only accept high-confidence market pairs
+            min_similarity: Similarity threshold for matcher
         """
         self.min_edge = min_edge
         self.polymarket_taker_fee = polymarket_taker_fee
         self.kalshi_taker_fee = kalshi_taker_fee
         self.gas_cost = gas_cost
         
-        self.matcher = MarketMatcher()
+        self.matcher = MarketMatcher(
+            min_similarity=min_similarity,
+            strict=strict_matching,
+        )
         self._opportunities: list[CrossPlatformOpportunity] = []
         self._opportunity_count = 0
     
