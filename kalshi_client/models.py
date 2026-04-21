@@ -42,6 +42,11 @@ class KalshiMarket:
     # Resolution criteria (from /markets/{ticker} or /events with_nested_markets)
     rules_primary: str = ""
     rules_secondary: str = ""
+
+    # Parent event title (clean, without subtitle), e.g. "Republican
+    # Presidential Nominee 2028". Useful when grouping markets back into
+    # events because composite `title` may include a candidate name.
+    event_title: str = ""
     
     @property
     def is_active(self) -> bool:

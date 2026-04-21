@@ -269,6 +269,7 @@ class KalshiClient:
                         category=category,
                         rules_primary=m.get("rules_primary", "") or "",
                         rules_secondary=m.get("rules_secondary", "") or "",
+                        event_title=ev_title,
                     )
                     if market.ticker:
                         self._markets_cache[market.ticker] = market
@@ -461,37 +462,44 @@ class KalshiClient:
             KalshiOrderBook object or None if not found
         """
         data = await self._get(f"/markets/{ticker}/orderbook")
-        if not data or "orderbook" not in data:
+        if not data:
             return None
-        
-        ob = data["orderbook"]
-        
-        # Parse YES bids (prices in cents)
-        yes_bids = []
-        for level in ob.get("yes", []):
-            if len(level) >= 2:
-                price_cents = level[0]
-                quantity = level[1]
-                yes_bids.append(PriceLevel(
-                    price=price_cents / 100.0,  # Convert to dollars
-                    size=float(quantity)
-                ))
-        
-        # Parse NO bids (prices in cents)
-        no_bids = []
-        for level in ob.get("no", []):
-            if len(level) >= 2:
-                price_cents = level[0]
-                quantity = level[1]
-                no_bids.append(PriceLevel(
-                    price=price_cents / 100.0,
-                    size=float(quantity)
-                ))
-        
+
+        # Newer API uses `orderbook_fp` with dollar-denominated string prices in
+        # `yes_dollars` / `no_dollars`. Legacy API used `orderbook` with int
+        # cent prices in `yes` / `no`. Support both.
+        ob = data.get("orderbook_fp") or data.get("orderbook")
+        if not ob:
+            return None
+
+        if "yes_dollars" in ob or "no_dollars" in ob:
+            yes_levels = ob.get("yes_dollars", []) or []
+            no_levels = ob.get("no_dollars", []) or []
+            price_scale = 1.0  # already in dollars
+        else:
+            yes_levels = ob.get("yes", []) or []
+            no_levels = ob.get("no", []) or []
+            price_scale = 0.01  # cents -> dollars
+
+        def _to_float(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return 0.0
+
+        yes_bids = [
+            PriceLevel(price=_to_float(lvl[0]) * price_scale, size=_to_float(lvl[1]))
+            for lvl in yes_levels if len(lvl) >= 2
+        ]
+        no_bids = [
+            PriceLevel(price=_to_float(lvl[0]) * price_scale, size=_to_float(lvl[1]))
+            for lvl in no_levels if len(lvl) >= 2
+        ]
+
         # Sort bids descending (best/highest first)
         yes_bids.sort(key=lambda x: x.price, reverse=True)
         no_bids.sort(key=lambda x: x.price, reverse=True)
-        
+
         return KalshiOrderBook(
             ticker=ticker,
             yes_bids=yes_bids,
