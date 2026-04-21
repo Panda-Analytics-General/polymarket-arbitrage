@@ -53,6 +53,8 @@ class PolyMarketLite:
     yes_token_id: str
     no_token_id: str
     volume_24h: float
+    description: str = ""
+    end_date: str = ""
 
 
 @dataclass
@@ -61,6 +63,7 @@ class PolyEvent:
     title: str
     volume_24h: float
     markets: list[PolyMarketLite]
+    slug: str = ""
 
 
 @dataclass
@@ -69,6 +72,9 @@ class KalshiMarketLite:
     title: str
     candidate: str          # yes_sub_title / subtitle
     volume: float
+    rules_primary: str = ""
+    rules_secondary: str = ""
+    close_time: str = ""
 
 
 @dataclass
@@ -183,9 +189,11 @@ async def fetch_polymarket_events(client: httpx.AsyncClient, top_n: int) -> list
                     yes_token_id=yes_id,
                     no_token_id=no_id,
                     volume_24h=float(m.get("volume24hr") or 0),
+                    description=m.get("description", "") or "",
+                    end_date=m.get("endDate") or m.get("end_date_iso") or "",
                 ))
             if markets:
-                out.append(PolyEvent(ev_id, title, vol, markets))
+                out.append(PolyEvent(ev_id, title, vol, markets, slug=e.get("slug", "") or ""))
         if len(data) < page:
             break
         offset += page
@@ -218,6 +226,9 @@ async def fetch_kalshi_events(kalshi: KalshiClient, top_n: int) -> list[KalshiEv
             title=m.title,
             candidate=cand,
             volume=float(m.volume or 0),
+            rules_primary=m.rules_primary or "",
+            rules_secondary=m.rules_secondary or "",
+            close_time=m.close_time.isoformat() if m.close_time else "",
         ))
 
     events: list[KalshiEvent] = []
@@ -277,36 +288,125 @@ def join_candidates(
 
 
 # ---------------------------------------------------------------------------
-# Arbitrage detection
+# ---------------------------------------------------------------------------
+# Arbitrage detection (depth-aware)
 # ---------------------------------------------------------------------------
 
-def calc_arb(poly_ob, kalshi_ob, fee_poly: float, fee_kalshi: float, gas: float):
-    """Return best (label, gross, net, buy, sell, buy_size, sell_size) or None."""
-    py_ask = poly_ob.best_ask_yes or 0
-    py_bid = poly_ob.best_bid_yes or 0
-    pn_ask = poly_ob.best_ask_no or 0
-    pn_bid = poly_ob.best_bid_no or 0
-    ky_ask = kalshi_ob.best_ask_yes or 0
-    ky_bid = kalshi_ob.best_bid_yes or 0
-    kn_ask = kalshi_ob.best_ask_no or 0
-    kn_bid = kalshi_ob.best_bid_no or 0
+# Fee models (per $1 notional traded):
+#   Polymarket: published formula 4 * feeRate * p * (1-p), with feeRate ~ 0.01
+#               => max 1% at p=0.5, ~0% at extremes. Charged on both buy & sell.
+#   Kalshi:     published formula 0.07 * p * (1-p) per contract ($1 notional)
+#               => max 1.75% at p=0.5. Charged on both buy & sell.
+#   Gas:        only Polymarket leg incurs gas (~$0.02 per order). Kalshi free.
 
-    candidates = []
-    if py_ask and ky_bid:
-        candidates.append(("YES poly->kalshi", py_ask, ky_bid, fee_poly, fee_kalshi))
-    if ky_ask and py_bid:
-        candidates.append(("YES kalshi->poly", ky_ask, py_bid, fee_kalshi, fee_poly))
-    if pn_ask and kn_bid:
-        candidates.append(("NO  poly->kalshi", pn_ask, kn_bid, fee_poly, fee_kalshi))
-    if kn_ask and pn_bid:
-        candidates.append(("NO  kalshi->poly", kn_ask, pn_bid, fee_kalshi, fee_poly))
+def _poly_fee(price: float) -> float:
+    """Polymarket taker fee per $1 notional at given price."""
+    return 0.04 * price * (1.0 - price)
 
+def _kalshi_fee(price: float) -> float:
+    """Kalshi taker fee per $1 notional at given price."""
+    return 0.07 * price * (1.0 - price)
+
+
+def _walk_books(buy_levels, sell_levels, buy_is_poly: bool, gas: float):
+    """Walk buy asks (ascending) vs sell bids (descending) and accumulate
+    profitable fills. Each level is a PriceLevel(price, size) where size is
+    in contracts ($1 notional each).
+
+    Returns (gross_profit, net_profit, total_size, best_buy_px, best_sell_px).
+    Returns None if no profitable level exists.
+    """
+    if not buy_levels or not sell_levels:
+        return None
+
+    # Copy as mutable
+    asks = [(l.price, l.size) for l in buy_levels]
+    bids = [(l.price, l.size) for l in sell_levels]
+
+    # Verify sort order
+    asks.sort(key=lambda x: x[0])           # cheapest first
+    bids.sort(key=lambda x: x[0], reverse=True)  # highest first
+
+    best_buy = asks[0][0]
+    best_sell = bids[0][0]
+
+    gross = 0.0
+    net = 0.0
+    size = 0.0
+    ai = bi = 0
+    a_remain = asks[0][1] if asks else 0
+    b_remain = bids[0][1] if bids else 0
+    gas_charged = False
+
+    while ai < len(asks) and bi < len(bids):
+        buy_px, _ = asks[ai]
+        sell_px, _ = bids[bi]
+
+        if buy_is_poly:
+            fb = _poly_fee(buy_px)
+            fs = _kalshi_fee(sell_px)
+        else:
+            fb = _kalshi_fee(buy_px)
+            fs = _poly_fee(sell_px)
+
+        per_unit = sell_px - buy_px - fb - fs
+        if per_unit <= 0:
+            break
+
+        fill = min(a_remain, b_remain)
+        if fill <= 0:
+            break
+
+        gross += (sell_px - buy_px) * fill
+        net += per_unit * fill
+        size += fill
+
+        if not gas_charged:
+            net -= gas  # one Polygon tx fee per arb (size-independent)
+            gas_charged = True
+
+        a_remain -= fill
+        b_remain -= fill
+        if a_remain <= 1e-9:
+            ai += 1
+            if ai < len(asks):
+                a_remain = asks[ai][1]
+        if b_remain <= 1e-9:
+            bi += 1
+            if bi < len(bids):
+                b_remain = bids[bi][1]
+
+    if size == 0 or net <= 0:
+        return None
+    return (gross, net, size, best_buy, best_sell)
+
+
+def calc_arb_depth(poly_ob, kalshi_ob, gas: float):
+    """Test all 4 directions and return best fill plan.
+    Returns dict with: label, net_profit, gross_profit, size, buy_px, sell_px.
+    """
+    directions = [
+        # (label, buy_levels, sell_levels, buy_is_poly)
+        ("YES poly->kalshi", poly_ob.yes.asks.levels,  kalshi_ob.yes.bids.levels, True),
+        ("YES kalshi->poly", kalshi_ob.yes.asks.levels, poly_ob.yes.bids.levels,  False),
+        ("NO  poly->kalshi", poly_ob.no.asks.levels,   kalshi_ob.no.bids.levels,  True),
+        ("NO  kalshi->poly", kalshi_ob.no.asks.levels,  poly_ob.no.bids.levels,   False),
+    ]
     best = None
-    for label, buy, sell, fb, fs in candidates:
-        gross = sell - buy
-        net = gross - buy * fb - sell * fs - 2 * gas
-        if best is None or net > best[2]:
-            best = (label, gross, net, buy, sell)
+    for label, buys, sells, buy_is_poly in directions:
+        r = _walk_books(buys, sells, buy_is_poly, gas)
+        if r is None:
+            continue
+        gross, net, size, b_px, s_px = r
+        if best is None or net > best["net_profit"]:
+            best = {
+                "label": label,
+                "gross_profit": gross,
+                "net_profit": net,
+                "size": size,
+                "buy_px": b_px,
+                "sell_px": s_px,
+            }
     return best
 
 
@@ -314,10 +414,9 @@ def calc_arb(poly_ob, kalshi_ob, fee_poly: float, fee_kalshi: float, gas: float)
 # Main
 # ---------------------------------------------------------------------------
 
-async def main(top_n: int, evt_sim: float, cand_sim: float, min_edge: float):
+async def main(top_n: int, evt_sim: float, cand_sim: float, min_edge: float,
+               llm_model: str = "", llm_concurrency: int = 4):
     cfg = load_config("config.yaml")
-    fee_poly = cfg.trading.taker_fee_bps / 10000
-    fee_kalshi = 0.01
     gas = cfg.trading.estimated_gas_per_order
 
     log.info("Fetching events from both platforms (top by volume)...")
@@ -390,19 +489,19 @@ async def main(top_n: int, evt_sim: float, cand_sim: float, min_edge: float):
                     market_id=pm.market_id, yes=py, no=pn,
                     timestamp=datetime.utcnow(),
                 )
-                best = calc_arb(poly_ob, kob, fee_poly, fee_kalshi, gas)
+                best = calc_arb_depth(poly_ob, kob, gas)
                 if best is None:
-                    fetch_fail[0] += 1
-                    return
-                label, gross, net, buy, sell = best
+                    return  # no profitable direction (still a successful fetch)
+                edge_per_unit = best["sell_px"] - best["buy_px"]
                 desc = (
                     f"{pe.title[:35]} | {pm.candidate[:18]} <> {km.candidate[:18]} | "
-                    f"{label} buy@{buy:.3f} sell@{sell:.3f}"
+                    f"{best['label']} buy@{best['buy_px']:.3f} sell@{best['sell_px']:.3f} "
+                    f"size={best['size']:.0f} net=${best['net_profit']:.2f}"
                 )
-                if net >= min_edge:
-                    opportunities.append((net, desc, pm, km))
+                if edge_per_unit >= min_edge:
+                    opportunities.append((best["net_profit"], desc, best, pe, pm, km, ke))
                 else:
-                    near_miss.append((net, desc))
+                    near_miss.append((best["net_profit"], desc))
             except Exception as e:
                 fetch_fail[0] += 1
                 log.debug(f"check {idx} failed: {e}")
@@ -423,22 +522,93 @@ async def main(top_n: int, evt_sim: float, cand_sim: float, min_edge: float):
         ])
 
         log.info("=" * 72)
-        log.info(f"OPPORTUNITIES (net edge >= {min_edge:.4f}): {len(opportunities)}")
-        for net, desc, pm, km in sorted(opportunities, reverse=True):
-            log.info(f"  net={net:+.4f}  {desc}")
+        log.info(f"OPPORTUNITIES (per-unit edge >= {min_edge:.4f}): {len(opportunities)}")
+        opps_sorted = sorted(opportunities, key=lambda x: x[0], reverse=True)
+        for net_profit, desc, _b, _pe, _pm, _km, _ke in opps_sorted:
+            log.info(f"  ${net_profit:>8.2f}  {desc}")
 
+        # ----- LLM verification (optional) ---------------------------------
+        verified: list = []
+        rejected: list = []
+        if llm_model and opps_sorted:
+            from core.llm_verifier import OllamaVerifier
+            log.info("-" * 72)
+            log.info(f"LLM verification: {len(opps_sorted)} opportunities -> {llm_model}")
+            async with OllamaVerifier(model=llm_model, max_concurrency=llm_concurrency) as verifier:
+                ok = await verifier.health_check()
+                if not ok:
+                    log.warning(f"Ollama model {llm_model} not available; skipping verification")
+                else:
+                    async def verify_one(item):
+                        net_profit, desc, best, pe, pm, km, ke = item
+                        kalshi_rules = (km.rules_primary or "").strip()
+                        if km.rules_secondary:
+                            kalshi_rules += "\n\nAdditional: " + km.rules_secondary
+                        if km.close_time:
+                            kalshi_rules += f"\n\nClose time: {km.close_time}"
+                        poly_rules = (pm.description or "").strip()
+                        if pm.end_date:
+                            poly_rules += f"\n\nEnd date: {pm.end_date}"
+                        decision = await verifier.verify_pair(
+                            poly_question=pm.question or pe.title,
+                            poly_rules=poly_rules,
+                            kalshi_question=km.title,
+                            kalshi_rules=kalshi_rules,
+                        )
+                        return item, decision
+
+                    results = await asyncio.gather(*[verify_one(o) for o in opps_sorted])
+                    for item, dec in results:
+                        net_profit, desc, *_ = item
+                        tag = f"{dec.verdict:>11s} c={dec.confidence:.2f}"
+                        if dec.is_equivalent:
+                            verified.append((item, dec))
+                            log.info(f"  ✅ {tag}  ${net_profit:>7.2f}  {desc[:90]}")
+                        else:
+                            rejected.append((item, dec))
+                            log.info(f"  ❌ {tag}  ${net_profit:>7.2f}  {desc[:90]}")
+                            log.info(f"        reason: {dec.reasoning[:200]}")
+
+        total_profit = sum(o[0] for o in opportunities)
+        verified_profit = sum(v[0][0] for v in verified)
+
+        # Top-10 verified with URLs
+        if verified:
+            log.info("-" * 72)
+            log.info("TOP 10 VERIFIED OPPORTUNITIES WITH URLS:")
+            verified_sorted = sorted(verified, key=lambda x: x[0][0], reverse=True)
+            for i, (item, dec) in enumerate(verified_sorted[:10], 1):
+                net_profit, desc, best, pe, pm, km, ke = item
+                poly_url = f"https://polymarket.com/event/{pe.slug}" if pe.slug else f"(no slug, event_id={pe.event_id})"
+                kalshi_url = f"https://kalshi.com/markets/{ke.event_ticker.lower()}"
+                log.info(f"  {i:2d}. ${net_profit:>8.2f}  {pm.question[:60]}")
+                log.info(f"       candidate: {pm.candidate} <> {km.candidate}")
+                log.info(f"       poly:   {poly_url}")
+                log.info(f"       kalshi: {kalshi_url}")
         log.info("-" * 72)
-        log.info(f"Top 15 near-misses (net < {min_edge:.4f}):")
+        log.info(f"Top 15 near-misses (per-unit edge < {min_edge:.4f}):")
         for net, desc in sorted(near_miss, reverse=True)[:15]:
-            log.info(f"  net={net:+.4f}  {desc}")
+            log.info(f"  ${net:>+8.2f}  {desc}")
         log.info("=" * 72)
 
         log.info("SUMMARY:")
-        log.info(f"  events scanned (each side): {top_n}")
-        log.info(f"  matched event pairs:        {len(ev_pairs)}")
-        log.info(f"  joined candidate pairs:     {len(joined)}")
-        log.info(f"  orderbook fetches failed:   {fetch_fail[0]}")
-        log.info(f"  arbitrage opportunities:    {len(opportunities)}")
+        log.info(f"  events scanned (each side):     {top_n}")
+        log.info(f"  matched event pairs:            {len(ev_pairs)}")
+        log.info(f"  joined candidate pairs:         {len(joined)}")
+        log.info(f"  orderbook fetches failed:       {fetch_fail[0]}")
+        log.info(f"  arbitrage opportunities:        {len(opportunities)}")
+        log.info(f"  total potential net profit:    ${total_profit:.2f}")
+        if llm_model and (verified or rejected):
+            log.info(f"  LLM-verified (equivalent):      {len(verified)}")
+            log.info(f"  LLM-rejected (different/unc):   {len(rejected)}")
+            log.info(f"  verified net profit:           ${verified_profit:.2f}")
+        if opportunities:
+            top5 = opps_sorted[:5]
+            top5_sum = sum(o[0] for o in top5)
+            log.info(f"  top-5 opportunities profit:    ${top5_sum:.2f}")
+            top10 = opps_sorted[:10]
+            top10_sum = sum(o[0] for o in top10)
+            log.info(f"  top-10 opportunities profit:   ${top10_sum:.2f}")
 
         await poly_client.disconnect()
         await kalshi.__aexit__(None, None, None)
@@ -450,5 +620,9 @@ if __name__ == "__main__":
     p.add_argument("--event-sim", type=float, default=0.7)
     p.add_argument("--candidate-sim", type=float, default=0.8)
     p.add_argument("--min-edge", type=float, default=0.005)
+    p.add_argument("--llm-model", type=str, default="",
+                   help="e.g. qwen3.5:9b. Empty disables LLM verification.")
+    p.add_argument("--llm-concurrency", type=int, default=4)
     args = p.parse_args()
-    asyncio.run(main(args.top, args.event_sim, args.candidate_sim, args.min_edge))
+    asyncio.run(main(args.top, args.event_sim, args.candidate_sim,
+                     args.min_edge, args.llm_model, args.llm_concurrency))
